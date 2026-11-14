@@ -1,5 +1,15 @@
 # Minimal Claude Relay
 
+## 一键部署（macOS）
+
+在项目目录执行：
+
+```bash
+./install.sh
+```
+
+脚本会运行测试、生成本地 Key、安装 macOS LaunchAgent、启动服务并检查 `/health`。部署完成后打开管理页完成 OAuth 授权。
+
 这是一个只保留固定上游 Claude 转发的版本：
 
 - 不使用数据库、Redis 或管理后台
