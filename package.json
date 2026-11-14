@@ -1,0 +1,14 @@
+{
+  "name": "minimal-claude-relay",
+  "private": true,
+  "version": "0.1.0",
+  "description": "A minimal fixed-upstream Claude Messages API relay",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
