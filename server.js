@@ -183,6 +183,80 @@ function sendJson(res, statusCode, value) {
   res.end(JSON.stringify(value))
 }
 
+function renderHomePage() {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Minimal Claude Relay</title>
+  <style>
+    :root { color-scheme: light; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    body { margin: 0; background: #f5f5f2; color: #222; }
+    main { max-width: 720px; margin: 48px auto; padding: 0 20px; }
+    .card { background: #fff; border: 1px solid #ddd; border-radius: 14px; padding: 24px; margin: 16px 0; box-shadow: 0 8px 30px #0000000b; }
+    h1 { margin: 0 0 8px; font-size: 26px; }
+    h2 { margin: 0 0 14px; font-size: 17px; }
+    p { color: #666; line-height: 1.6; }
+    label { display:block; margin: 12px 0 6px; font-size: 14px; font-weight: 600; }
+    input, textarea { box-sizing: border-box; width: 100%; border: 1px solid #ccc; border-radius: 8px; padding: 10px; font: inherit; }
+    textarea { min-height: 100px; resize: vertical; }
+    button, a.button { display:inline-block; border:0; border-radius: 8px; background:#222; color:#fff; padding:10px 14px; cursor:pointer; text-decoration:none; font: inherit; }
+    button.secondary { background:#e9e9e5; color:#222; }
+    .row { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+    pre { white-space: pre-wrap; word-break: break-word; background:#f2f2ef; border-radius:8px; padding:12px; min-height: 20px; }
+    .muted { font-size: 13px; color:#777; }
+    .ok { color:#157347; } .error { color:#b42318; }
+  </style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <h1>Minimal Claude Relay</h1>
+    <p>这是单账号 Claude 中转。这里的 Key 是进入中转的 <code>RELAY_API_KEY</code>，OAuth Token 会保存在服务端本地。</p>
+    <p class="muted">服务地址：<span id="origin"></span></p>
+  </div>
+  <div class="card">
+    <h2>1. 连接入站 Key</h2>
+    <label for="key">RELAY_API_KEY</label>
+    <input id="key" type="password" autocomplete="off" placeholder="粘贴本地 .env 里的 RELAY_API_KEY">
+    <div class="row"><button class="secondary" onclick="saveKey()">保存到本页</button><button class="secondary" onclick="loadStatus()">查看 OAuth 状态</button></div>
+    <pre id="status">尚未查询状态</pre>
+  </div>
+  <div class="card">
+    <h2>2. Claude OAuth 授权</h2>
+    <p>点击后打开 Claude 登录授权页面。授权完成后，把浏览器地址栏里的完整回调地址粘贴回来。</p>
+    <div class="row"><button onclick="startOAuth()">获取授权链接</button><a id="authLink" class="button" target="_blank" rel="noreferrer" style="display:none">打开 Claude 授权页</a></div>
+    <label for="callback">回调地址</label>
+    <textarea id="callback" placeholder="https://platform.claude.com/oauth/code/callback?..."></textarea>
+    <div class="row"><button onclick="exchangeOAuth()">完成 OAuth 授权</button></div>
+    <pre id="result">等待操作</pre>
+  </div>
+  <div class="card">
+    <h2>3. 客户端地址</h2>
+    <p>Claude Code 使用：</p>
+    <pre>ANTHROPIC_BASE_URL=${'http://127.0.0.1:3001/api/'}
+ANTHROPIC_AUTH_TOKEN=你的 RELAY_API_KEY</pre>
+    <p>健康检查：<a href="/health">/health</a>　API：<code>/api/v1/messages</code></p>
+  </div>
+</main>
+<script>
+const keyInput = document.getElementById('key')
+const statusBox = document.getElementById('status')
+const resultBox = document.getElementById('result')
+document.getElementById('origin').textContent = location.origin
+keyInput.value = sessionStorage.getItem('minimalRelayKey') || ''
+function saveKey() { sessionStorage.setItem('minimalRelayKey', keyInput.value.trim()); resultBox.textContent = '已保存到当前浏览器标签页' }
+function authHeaders(json) { const key = keyInput.value.trim(); if (!key) throw new Error('请先填写 RELAY_API_KEY'); const h = { Authorization: 'Bearer ' + key }; if (json) h['Content-Type'] = 'application/json'; return h }
+async function api(path, options = {}) { const response = await fetch(path, { ...options, headers: { ...authHeaders(Boolean(options.body)), ...(options.headers || {}) } }); const text = await response.text(); let data; try { data = JSON.parse(text) } catch { data = { raw: text } } if (!response.ok) throw new Error(data.error?.message || data.error || text || ('HTTP ' + response.status)); return data }
+async function loadStatus() { try { saveKey(); const data = await api('/oauth/status'); statusBox.className = 'ok'; statusBox.textContent = JSON.stringify(data, null, 2) } catch (e) { statusBox.className = 'error'; statusBox.textContent = e.message } }
+async function startOAuth() { try { saveKey(); const data = await api('/oauth/authorize'); const link = document.getElementById('authLink'); link.href = data.authUrl; link.style.display = 'inline-block'; resultBox.className = 'ok'; resultBox.textContent = '授权链接已生成。点击“打开 Claude 授权页”，完成后粘贴回调地址。' } catch (e) { resultBox.className = 'error'; resultBox.textContent = e.message } }
+async function exchangeOAuth() { try { saveKey(); const callbackUrl = document.getElementById('callback').value.trim(); if (!callbackUrl) throw new Error('请粘贴回调地址'); const data = await api('/oauth/exchange', { method: 'POST', body: JSON.stringify({ callbackUrl }) }); resultBox.className = 'ok'; resultBox.textContent = 'OAuth 完成：\\n' + JSON.stringify(data, null, 2); loadStatus() } catch (e) { resultBox.className = 'error'; resultBox.textContent = e.message } }
+</script>
+</body>
+</html>`
+}
+
 function isAuthorized(req, config) {
   return getClientApiKey(req) === config.relayApiKey
 }
@@ -312,11 +386,8 @@ async function handleResponses(req, res, config, bodyBuffer) {
 function createServer(config) {
   return http.createServer(async (req, res) => {
     if (req.method === 'GET' && req.url === '/') {
-      sendJson(res, 200, {
-        service: 'minimal-claude-relay',
-        ok: true,
-        endpoints: ['/health', '/oauth/authorize', '/oauth/exchange', '/oauth/status', '/api/v1/messages', '/v1/responses']
-      })
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end(renderHomePage())
       return
     }
 
