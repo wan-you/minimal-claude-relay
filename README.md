@@ -10,6 +10,12 @@
 
 脚本会运行测试、生成本地 Key、安装 macOS LaunchAgent、启动服务并检查 `/health`。部署完成后打开管理页完成 OAuth 授权。
 
+别人可以直接复制下面这一条命令：
+
+```bash
+bash -c 'set -e; d="$HOME/minimal-claude-relay"; if [ -d "$d/.git" ]; then git -C "$d" pull --ff-only; else git clone https://github.com/wan-you/minimal-claude-relay.git "$d"; fi; exec "$d/install.sh"'
+```
+
 这是一个只保留固定上游 Claude 转发的版本：
 
 - 不使用数据库、Redis 或管理后台
