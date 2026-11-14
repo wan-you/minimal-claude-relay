@@ -1,7 +1,9 @@
 'use strict'
 
 const crypto = require('node:crypto')
+const { execFileSync } = require('node:child_process')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 
 const AUTHORIZE_URL = 'https://claude.ai/oauth/authorize'
@@ -9,6 +11,7 @@ const TOKEN_URL = 'https://platform.claude.com/v1/oauth/token'
 const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 const REDIRECT_URI = 'https://platform.claude.com/oauth/code/callback'
 const SCOPES = 'org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload'
+const CLAUDE_CODE_KEYCHAIN_SERVICE = 'Claude Code-credentials'
 
 function randomBase64Url(bytes = 32) {
   return crypto.randomBytes(bytes).toString('base64url')
@@ -50,14 +53,95 @@ async function exchangeToken(payload) {
   return data
 }
 
+function keychainAccounts({ env = process.env, homeDirectory = os.homedir() } = {}) {
+  return [...new Set([
+    env.CLAUDE_CODE_KEYCHAIN_ACCOUNT,
+    env.USER,
+    env.LOGNAME,
+    path.basename(homeDirectory)
+  ].filter(Boolean))]
+}
+
+function normalizeKeychainOAuth(value) {
+  if (!value || typeof value !== 'object') return null
+  const accessToken = typeof value.accessToken === 'string' ? value.accessToken.trim() : ''
+  const refreshToken = typeof value.refreshToken === 'string' ? value.refreshToken.trim() : ''
+  if (!accessToken && !refreshToken) return null
+
+  const expiresAt = Number(value.expiresAt) || 0
+  return { accessToken, refreshToken, expiresAt }
+}
+
+/**
+ * Read Claude Code's first-party OAuth record from the macOS Keychain.
+ * The token values are never printed or logged; callers receive the parsed
+ * credential object so it can be written to the relay's private token store.
+ */
+function readClaudeCodeKeychain({
+  platform = process.platform,
+  service = CLAUDE_CODE_KEYCHAIN_SERVICE,
+  accounts = keychainAccounts(),
+  execFileSyncImpl = execFileSync
+} = {}) {
+  if (platform !== 'darwin') return null
+
+  for (const account of accounts) {
+    try {
+      const raw = execFileSyncImpl('/usr/bin/security', [
+        'find-generic-password',
+        '-s', service,
+        '-a', account,
+        '-w'
+      ], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 3000
+      })
+      const record = JSON.parse(String(raw))
+      const oauth = normalizeKeychainOAuth(record.claudeAiOauth)
+      if (oauth) return { ...oauth, account }
+    } catch {
+      // Keychain access is optional. Fall through to the next account or the
+      // normal relay token store when this machine has no usable Claude login.
+    }
+  }
+
+  return null
+}
+
 class ClaudeOAuthManager {
-  constructor({ storePath, accessToken = '', refreshToken = '', expiresAt = '' } = {}) {
+  constructor({
+    storePath,
+    accessToken = '',
+    refreshToken = '',
+    expiresAt = '',
+    autoImport = false,
+    keychainReader = readClaudeCodeKeychain
+  } = {}) {
     this.storePath = storePath
     this.pending = new Map()
     this.accessToken = accessToken || ''
     this.refreshToken = refreshToken || ''
     this.expiresAt = Number(expiresAt) || 0
+    this.credentialSource = this.accessToken || this.refreshToken ? 'environment' : null
+    this.keychainAccount = null
     this.load()
+    if (autoImport && !this.accessToken && !this.refreshToken) {
+      let imported = null
+      try {
+        imported = keychainReader()
+      } catch {
+        imported = null
+      }
+      if (imported) {
+        this.accessToken = imported.accessToken
+        this.refreshToken = imported.refreshToken
+        this.expiresAt = imported.expiresAt
+        this.credentialSource = 'claude-code-keychain'
+        this.keychainAccount = imported.account || null
+        this.save()
+      }
+    }
   }
 
   load() {
@@ -66,6 +150,7 @@ class ClaudeOAuthManager {
       this.accessToken = data.accessToken || this.accessToken
       this.refreshToken = data.refreshToken || this.refreshToken
       this.expiresAt = Number(data.expiresAt) || this.expiresAt
+      if (this.accessToken || this.refreshToken) this.credentialSource = 'store'
     } catch (error) {
       if (error.code !== 'ENOENT') throw error
     }
@@ -128,6 +213,7 @@ class ClaudeOAuthManager {
     this.accessToken = data.access_token
     this.refreshToken = data.refresh_token || this.refreshToken
     this.expiresAt = Date.now() + Number(data.expires_in || 3600) * 1000
+    this.credentialSource = 'oauth'
   }
 
   async refresh() {
@@ -153,9 +239,20 @@ class ClaudeOAuthManager {
       hasAccessToken: Boolean(this.accessToken),
       hasRefreshToken: Boolean(this.refreshToken),
       expiresAt: this.expiresAt ? new Date(this.expiresAt).toISOString() : null,
-      expired: this.expiresAt > 0 && this.expiresAt <= Date.now()
+      expired: this.expiresAt > 0 && this.expiresAt <= Date.now(),
+      source: this.credentialSource
     }
   }
 }
 
-module.exports = { ClaudeOAuthManager, AUTHORIZE_URL, TOKEN_URL, CLIENT_ID, REDIRECT_URI }
+module.exports = {
+  ClaudeOAuthManager,
+  AUTHORIZE_URL,
+  TOKEN_URL,
+  CLIENT_ID,
+  REDIRECT_URI,
+  CLAUDE_CODE_KEYCHAIN_SERVICE,
+  keychainAccounts,
+  normalizeKeychainOAuth,
+  readClaudeCodeKeychain
+}

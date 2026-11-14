@@ -69,6 +69,18 @@ curl -H "Authorization: Bearer $RELAY_API_KEY" \
   http://127.0.0.1:3000/oauth/status
 ```
 
+### 自动复用已登录的 Claude Code
+
+在 macOS 上，relay 默认会在自己的 OAuth token store 为空时读取当前用户 Keychain 里的 `Claude Code-credentials`，导入其中的 `claudeAiOauth` 记录。这样已有的 Claude Code 登录无需再次打开浏览器授权：
+
+```env
+CLAUDE_AUTH_MODE=oauth
+CLAUDE_CODE_OAUTH_IMPORT=auto
+CLAUDE_OAUTH_STORE=.oauth-tokens.json
+```
+
+导入只发生在 relay store 没有 access token 和 refresh token 时。之后由 relay 自己保存并刷新 token，启动时不会把已刷新的 token 覆盖回 Keychain 里的旧副本。设置 `CLAUDE_CODE_OAUTH_IMPORT=off` 可关闭自动导入；如果 Keychain 使用的账户名不是当前用户，可设置 `CLAUDE_CODE_KEYCHAIN_ACCOUNT`。
+
 DeepSeek Harness 继续使用 Anthropic Messages 接口时，把它的 Base URL 指向：
 
 ```text

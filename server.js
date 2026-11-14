@@ -2,6 +2,7 @@
 
 const http = require('node:http')
 const https = require('node:https')
+const fs = require('node:fs')
 const pathModule = require('node:path')
 const { URL } = require('node:url')
 const { translateDeepSeekHarnessRequest } = require('./deepseekHarnessCompat')
@@ -11,7 +12,12 @@ const {
   createSseTransformer
 } = require('./responsesBridge')
 const { AnthropicSseAggregator } = require('./anthropicAggregator')
-const { ClaudeOAuthManager } = require('./claudeOAuthManager')
+const {
+  ClaudeOAuthManager,
+  CLAUDE_CODE_KEYCHAIN_SERVICE,
+  keychainAccounts,
+  readClaudeCodeKeychain
+} = require('./claudeOAuthManager')
 
 const MAX_BODY_BYTES = 16 * 1024 * 1024
 
@@ -44,11 +50,19 @@ function getConfig(env = process.env) {
     throw new Error('ANTHROPIC_UPSTREAM_URL must use http or https')
   }
 
+  const configuredAuthMode = (env.CLAUDE_AUTH_MODE || '').toLowerCase()
+  const importMode = (env.CLAUDE_CODE_OAUTH_IMPORT || 'auto').toLowerCase()
+  const autoImportClaudeCodeOAuth = !['false', '0', 'off', 'never'].includes(importMode) && configuredAuthMode !== 'api'
   const oauthManager = new ClaudeOAuthManager({
     storePath: env.CLAUDE_OAUTH_STORE || pathModule.join(process.cwd(), '.oauth-tokens.json'),
     accessToken: env.CLAUDE_OAUTH_ACCESS_TOKEN,
     refreshToken: env.CLAUDE_OAUTH_REFRESH_TOKEN,
-    expiresAt: env.CLAUDE_OAUTH_EXPIRES_AT
+    expiresAt: env.CLAUDE_OAUTH_EXPIRES_AT,
+    autoImport: autoImportClaudeCodeOAuth,
+    keychainReader: () => readClaudeCodeKeychain({
+      service: env.CLAUDE_CODE_KEYCHAIN_SERVICE || CLAUDE_CODE_KEYCHAIN_SERVICE,
+      accounts: keychainAccounts({ env, homeDirectory: env.HOME })
+    })
   })
   const authMode = (env.CLAUDE_AUTH_MODE || (oauthManager.status().configured ? 'oauth' : 'api')).toLowerCase()
   if (authMode !== 'oauth' && !upstreamApiKey) throw new Error('ANTHROPIC_API_KEY is required in api auth mode')
@@ -62,6 +76,7 @@ function getConfig(env = process.env) {
     relayApiKey,
     authMode,
     oauthManager,
+    logPath: env.RELAY_LOG_PATH || pathModule.join(process.cwd(), 'launchd.log'),
     authHeader: (env.ANTHROPIC_AUTH_HEADER || (authMode === 'oauth' ? 'authorization' : 'x-api-key')).toLowerCase(),
     deepSeekHarnessCompat: env.DEEPSEEK_HARNESS_COMPAT !== 'false'
   }
@@ -239,6 +254,12 @@ function renderHomePage() {
 ANTHROPIC_AUTH_TOKEN=你的 RELAY_API_KEY</pre>
     <p>健康检查：<a href="/health">/health</a>　API：<code>/api/v1/messages</code></p>
   </div>
+  <div class="card">
+    <h2>4. 服务日志</h2>
+    <p>日志接口需要入站 Key，只显示最近记录。</p>
+    <div class="row"><button class="secondary" onclick="loadLogs()">刷新日志</button></div>
+    <pre id="logs">尚未加载日志</pre>
+  </div>
 </main>
 <script>
 const keyInput = document.getElementById('key')
@@ -252,6 +273,7 @@ async function api(path, options = {}) { const response = await fetch(path, { ..
 async function loadStatus() { try { saveKey(); const data = await api('/oauth/status'); statusBox.className = 'ok'; statusBox.textContent = JSON.stringify(data, null, 2) } catch (e) { statusBox.className = 'error'; statusBox.textContent = e.message } }
 async function startOAuth() { try { saveKey(); const data = await api('/oauth/authorize'); const link = document.getElementById('authLink'); link.href = data.authUrl; link.style.display = 'inline-block'; resultBox.className = 'ok'; resultBox.textContent = '授权链接已生成。点击“打开 Claude 授权页”，完成后粘贴回调地址。' } catch (e) { resultBox.className = 'error'; resultBox.textContent = e.message } }
 async function exchangeOAuth() { try { saveKey(); const callbackUrl = document.getElementById('callback').value.trim(); if (!callbackUrl) throw new Error('请粘贴回调地址'); const data = await api('/oauth/exchange', { method: 'POST', body: JSON.stringify({ callbackUrl }) }); resultBox.className = 'ok'; resultBox.textContent = 'OAuth 完成：\\n' + JSON.stringify(data, null, 2); loadStatus() } catch (e) { resultBox.className = 'error'; resultBox.textContent = e.message } }
+async function loadLogs() { try { saveKey(); const data = await api('/logs?lines=200'); document.getElementById('logs').textContent = data.logs || '(暂无日志)' } catch (e) { document.getElementById('logs').textContent = e.message } }
 </script>
 </body>
 </html>`
@@ -259,6 +281,16 @@ async function exchangeOAuth() { try { saveKey(); const callbackUrl = document.g
 
 function isAuthorized(req, config) {
   return getClientApiKey(req) === config.relayApiKey
+}
+
+function readRecentLogs(logPath, lineCount = 200) {
+  try {
+    const content = fs.readFileSync(logPath, 'utf8')
+    const count = Math.max(1, Math.min(Number(lineCount) || 200, 1000))
+    return content.split(/\r?\n/).slice(-count).join('\n')
+  } catch (error) {
+    return `日志暂不可用：${error.message}`
+  }
 }
 
 async function handleNativeMessages(req, res, config, bodyBuffer) {
@@ -429,6 +461,16 @@ function createServer(config) {
       return
     }
 
+    if (path === '/logs') {
+      if (req.method !== 'GET' || !isAuthorized(req, config)) {
+        sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Invalid relay API key' } })
+        return
+      }
+      const query = new URL(req.url, 'http://relay.local').searchParams
+      sendJson(res, 200, { logs: readRecentLogs(config.logPath, query.get('lines') || 200), path: config.logPath })
+      return
+    }
+
     const isMessages = path.startsWith('/v1/messages')
     const isResponses = path === '/v1/responses' || path === '/v1/responses/compact'
     if (req.method !== 'POST' || (!isMessages && !isResponses)) {
@@ -445,6 +487,8 @@ function createServer(config) {
       }))
       return
     }
+
+    console.log(`[request] ${req.method} ${req.url}`)
 
     try {
       const body = await readBody(req)
