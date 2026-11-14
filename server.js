@@ -276,6 +276,16 @@ function renderHomePage() {
     pre { white-space: pre-wrap; word-break: break-word; background:#f2f2ef; border-radius:8px; padding:12px; min-height: 20px; }
     .muted { font-size: 13px; color:#777; }
     .ok { color:#157347; } .error { color:#b42318; }
+    .status-panel { min-height: 20px; }
+    .info-grid { display:grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap:10px; }
+    .metric { background:#f2f2ef; border-radius:9px; padding:12px; }
+    .metric-label { color:#777; font-size:12px; margin-bottom:4px; }
+    .metric-value { font-weight:600; overflow-wrap:anywhere; }
+    .probe { border-radius:10px; padding:14px; margin-bottom:12px; border:1px solid #ddd; }
+    .probe.good { background:#edf8f0; border-color:#b7dfc2; color:#14532d; }
+    .probe.bad { background:#fff1f0; border-color:#f3b4ae; color:#8a1c13; }
+    .probe-title { font-size:18px; font-weight:700; margin-bottom:5px; }
+    @media (max-width:560px) { .info-grid { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
@@ -290,7 +300,7 @@ function renderHomePage() {
     <label for="key">RELAY_API_KEY</label>
     <input id="key" type="password" autocomplete="off" placeholder="粘贴本地 .env 里的 RELAY_API_KEY">
     <div class="row"><button class="secondary" onclick="saveKey()">保存到本页</button><button class="secondary" onclick="loadStatus()">查看 OAuth 状态</button></div>
-    <pre id="status">尚未查询状态</pre>
+    <div id="status" class="status-panel">尚未查询状态</div>
   </div>
   <div class="card">
     <h2>2. Claude OAuth 授权</h2>
@@ -318,7 +328,7 @@ ANTHROPIC_AUTH_TOKEN=你的 RELAY_API_KEY</pre>
     <h2>5. 上游检测与服务管理</h2>
     <p>检测会真实请求 Claude 上游的轻量模型列表接口，不调用模型生成，不消耗文本 Token。</p>
     <div class="row"><button class="secondary" onclick="loadDiagnostics()">检测上游连通性</button><button onclick="restartRelay()">重启服务</button></div>
-    <pre id="diagnostics">尚未检测</pre>
+    <div id="diagnostics" class="status-panel">尚未检测</div>
   </div>
 </main>
 <script>
@@ -328,13 +338,17 @@ const resultBox = document.getElementById('result')
 document.getElementById('origin').textContent = location.origin
 keyInput.value = sessionStorage.getItem('minimalRelayKey') || ''
 function saveKey() { sessionStorage.setItem('minimalRelayKey', keyInput.value.trim()); resultBox.textContent = '已保存到当前浏览器标签页' }
+function esc(value) { return String(value ?? '-').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])) }
+function metric(label, value) { return '<div class="metric"><div class="metric-label">' + esc(label) + '</div><div class="metric-value">' + esc(value) + '</div></div>' }
+function renderOAuth(data) { const state = data.configured ? (data.expired ? '已过期' : '已连接') : '未连接'; return '<div class="probe ' + (data.configured && !data.expired ? 'good' : 'bad') + '"><div class="probe-title">OAuth：' + state + '</div><div class="info-grid">' + metric('Token 来源', data.source || '-') + metric('Access Token', data.hasAccessToken ? '已配置' : '未配置') + metric('Refresh Token', data.hasRefreshToken ? '已配置' : '未配置') + metric('过期时间', data.expiresAt || '-') + '</div></div>' }
+function renderDiagnostics(data) { const p = data.upstream_probe || {}; const probeOk = p.ok === true; const probeTitle = probeOk ? '上游 Claude 可用' : (p.network_reachable ? '上游可达，但 API 检测失败' : '上游不可达'); return '<div class="probe ' + (probeOk ? 'good' : 'bad') + '"><div class="probe-title">' + probeTitle + '</div><div class="info-grid">' + metric('HTTP 状态', p.status_code || '-') + metric('延迟', p.latency_ms != null ? p.latency_ms + ' ms' : '-') + metric('网络连通', p.network_reachable ? '是' : '否') + metric('鉴权状态', p.auth_ready ? '可用' : '未就绪') + '</div>' + (p.error ? '<p>' + esc(p.error) + '</p>' : '') + '</div><div class="info-grid">' + metric('上游地址', data.upstream) + metric('认证模式', data.auth_mode) + metric('进程 PID', data.pid) + metric('运行时间', data.uptime_seconds + ' 秒') + metric('LaunchAgent', data.launchd?.state || '未知') + metric('日志路径', data.log_path) + '</div>' + renderOAuth(data.oauth || {}) }
 function authHeaders(json) { const key = keyInput.value.trim(); if (!key) throw new Error('请先填写 RELAY_API_KEY'); const h = { Authorization: 'Bearer ' + key }; if (json) h['Content-Type'] = 'application/json'; return h }
 async function api(path, options = {}) { const response = await fetch(path, { ...options, headers: { ...authHeaders(Boolean(options.body)), ...(options.headers || {}) } }); const text = await response.text(); let data; try { data = JSON.parse(text) } catch { data = { raw: text } } if (!response.ok) throw new Error(data.error?.message || data.error || text || ('HTTP ' + response.status)); return data }
-async function loadStatus() { try { saveKey(); const data = await api('/oauth/status'); statusBox.className = 'ok'; statusBox.textContent = JSON.stringify(data, null, 2) } catch (e) { statusBox.className = 'error'; statusBox.textContent = e.message } }
+async function loadStatus() { try { saveKey(); const data = await api('/oauth/status'); statusBox.className = ''; statusBox.innerHTML = renderOAuth(data) } catch (e) { statusBox.className = 'error'; statusBox.textContent = e.message } }
 async function startOAuth() { try { saveKey(); const data = await api('/oauth/authorize'); const link = document.getElementById('authLink'); link.href = data.authUrl; link.style.display = 'inline-block'; resultBox.className = 'ok'; resultBox.textContent = '授权链接已生成。点击“打开 Claude 授权页”，完成后粘贴回调地址。' } catch (e) { resultBox.className = 'error'; resultBox.textContent = e.message } }
 async function exchangeOAuth() { try { saveKey(); const callbackUrl = document.getElementById('callback').value.trim(); if (!callbackUrl) throw new Error('请粘贴回调地址'); const data = await api('/oauth/exchange', { method: 'POST', body: JSON.stringify({ callbackUrl }) }); resultBox.className = 'ok'; resultBox.textContent = 'OAuth 完成：\\n' + JSON.stringify(data, null, 2); loadStatus() } catch (e) { resultBox.className = 'error'; resultBox.textContent = e.message } }
 async function loadLogs() { try { saveKey(); const data = await api('/logs?lines=200'); document.getElementById('logs').textContent = data.logs || '(暂无日志)' } catch (e) { document.getElementById('logs').textContent = e.message } }
-async function loadDiagnostics() { try { saveKey(); const data = await api('/diagnostics'); document.getElementById('diagnostics').textContent = JSON.stringify(data, null, 2) } catch (e) { document.getElementById('diagnostics').textContent = e.message } }
+async function loadDiagnostics() { try { saveKey(); const data = await api('/diagnostics'); const box = document.getElementById('diagnostics'); box.className = ''; box.innerHTML = renderDiagnostics(data) } catch (e) { document.getElementById('diagnostics').className = 'error'; document.getElementById('diagnostics').textContent = e.message } }
 async function restartRelay() { if (!confirm('确定重启本地中转服务吗？')) return; try { saveKey(); const data = await api('/admin/restart', { method: 'POST', body: '{}' }); document.getElementById('diagnostics').textContent = JSON.stringify(data, null, 2) + '\\n服务正在重启，请稍后刷新页面。' } catch (e) { document.getElementById('diagnostics').textContent = e.message } }
 </script>
 </body>
