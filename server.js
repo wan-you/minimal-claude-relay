@@ -2,6 +2,7 @@
 
 const http = require('node:http')
 const https = require('node:https')
+const pathModule = require('node:path')
 const { URL } = require('node:url')
 const { translateDeepSeekHarnessRequest } = require('./deepseekHarnessCompat')
 const {
@@ -10,6 +11,7 @@ const {
   createSseTransformer
 } = require('./responsesBridge')
 const { AnthropicSseAggregator } = require('./anthropicAggregator')
+const { ClaudeOAuthManager } = require('./claudeOAuthManager')
 
 const MAX_BODY_BYTES = 16 * 1024 * 1024
 
@@ -35,7 +37,6 @@ function getConfig(env = process.env) {
   const upstreamBaseUrl = env.ANTHROPIC_UPSTREAM_URL || 'https://api.anthropic.com'
   const upstreamApiKey = env.ANTHROPIC_API_KEY
   const relayApiKey = env.RELAY_API_KEY
-  if (!upstreamApiKey) throw new Error('ANTHROPIC_API_KEY is required')
   if (!relayApiKey) throw new Error('RELAY_API_KEY is required')
 
   const parsed = new URL(upstreamBaseUrl)
@@ -43,13 +44,25 @@ function getConfig(env = process.env) {
     throw new Error('ANTHROPIC_UPSTREAM_URL must use http or https')
   }
 
+  const oauthManager = new ClaudeOAuthManager({
+    storePath: env.CLAUDE_OAUTH_STORE || pathModule.join(process.cwd(), '.oauth-tokens.json'),
+    accessToken: env.CLAUDE_OAUTH_ACCESS_TOKEN,
+    refreshToken: env.CLAUDE_OAUTH_REFRESH_TOKEN,
+    expiresAt: env.CLAUDE_OAUTH_EXPIRES_AT
+  })
+  const authMode = (env.CLAUDE_AUTH_MODE || (oauthManager.status().configured ? 'oauth' : 'api')).toLowerCase()
+  if (authMode !== 'oauth' && !upstreamApiKey) throw new Error('ANTHROPIC_API_KEY is required in api auth mode')
+  if (!['api', 'oauth'].includes(authMode)) throw new Error('CLAUDE_AUTH_MODE must be api or oauth')
+
   return {
     host: env.HOST || '127.0.0.1',
     port: Number(env.PORT || 3000),
     upstreamBaseUrl: parsed,
     upstreamApiKey,
     relayApiKey,
-    authHeader: (env.ANTHROPIC_AUTH_HEADER || 'x-api-key').toLowerCase(),
+    authMode,
+    oauthManager,
+    authHeader: (env.ANTHROPIC_AUTH_HEADER || (authMode === 'oauth' ? 'authorization' : 'x-api-key')).toLowerCase(),
     deepSeekHarnessCompat: env.DEEPSEEK_HARNESS_COMPAT !== 'false'
   }
 }
@@ -85,7 +98,7 @@ function copyResponseHeaders(upstreamResponse, response) {
   }
 }
 
-function buildUpstreamHeaders(req, body, config) {
+function buildUpstreamHeaders(req, body, config, credential) {
   const headers = {
     'content-type': req.headers['content-type'] || 'application/json',
     'content-length': String(body.length),
@@ -109,8 +122,8 @@ function buildUpstreamHeaders(req, body, config) {
   ]) {
     if (req.headers[name]) headers[name] = req.headers[name]
   }
-  if (config.authHeader === 'authorization') headers.authorization = `Bearer ${config.upstreamApiKey}`
-  else headers['x-api-key'] = config.upstreamApiKey
+  if (config.authHeader === 'authorization') headers.authorization = `Bearer ${credential}`
+  else headers['x-api-key'] = credential
   return headers
 }
 
@@ -121,31 +134,38 @@ function upstreamPath(config, path) {
   return joined.startsWith('/') ? joined : `/${joined}`
 }
 
-function relayRequest(req, res, config, body, path, handlers) {
-  const target = config.upstreamBaseUrl
-  const transport = target.protocol === 'http:' ? http : https
-  const upstreamRequest = transport.request(
-    {
-      protocol: target.protocol,
-      hostname: target.hostname,
-      port: target.port || (target.protocol === 'https:' ? 443 : 80),
-      method: 'POST',
-      path: upstreamPath(config, path),
-      headers: buildUpstreamHeaders(req, body, config),
-      timeout: Number(process.env.UPSTREAM_TIMEOUT_MS || 600000)
-    },
-    (upstreamResponse) => handlers.response(upstreamResponse)
-  )
+async function relayRequest(req, res, config, body, path, handlers) {
+  try {
+    const credential = config.authMode === 'oauth'
+      ? await config.oauthManager.getAccessToken()
+      : config.upstreamApiKey
+    const target = config.upstreamBaseUrl
+    const transport = target.protocol === 'http:' ? http : https
+    const upstreamRequest = transport.request(
+      {
+        protocol: target.protocol,
+        hostname: target.hostname,
+        port: target.port || (target.protocol === 'https:' ? 443 : 80),
+        method: 'POST',
+        path: upstreamPath(config, path),
+        headers: buildUpstreamHeaders(req, body, config, credential),
+        timeout: Number(process.env.UPSTREAM_TIMEOUT_MS || 600000)
+      },
+      (upstreamResponse) => handlers.response(upstreamResponse)
+    )
 
-  upstreamRequest.on('timeout', () => upstreamRequest.destroy(new Error('Upstream request timed out')))
-  upstreamRequest.on('error', (error) => handlers.error(error))
-  req.on('aborted', () => {
-    if (!upstreamRequest.destroyed) upstreamRequest.destroy()
-  })
-  res.on('close', () => {
-    if (!res.writableFinished && !upstreamRequest.destroyed) upstreamRequest.destroy()
-  })
-  upstreamRequest.end(body)
+    upstreamRequest.on('timeout', () => upstreamRequest.destroy(new Error('Upstream request timed out')))
+    upstreamRequest.on('error', (error) => handlers.error(error))
+    req.on('aborted', () => {
+      if (!upstreamRequest.destroyed) upstreamRequest.destroy()
+    })
+    res.on('close', () => {
+      if (!res.writableFinished && !upstreamRequest.destroyed) upstreamRequest.destroy()
+    })
+    upstreamRequest.end(body)
+  } catch (error) {
+    handlers.error(error)
+  }
 }
 
 function sendRelayError(res, error) {
@@ -156,6 +176,15 @@ function sendRelayError(res, error) {
   const statusCode = error.statusCode || (error.code === 'ETIMEDOUT' ? 504 : 502)
   res.writeHead(statusCode, { 'content-type': 'application/json' })
   res.end(JSON.stringify({ type: 'error', error: { type: 'relay_error', message: error.message } }))
+}
+
+function sendJson(res, statusCode, value) {
+  res.writeHead(statusCode, { 'content-type': 'application/json' })
+  res.end(JSON.stringify(value))
+}
+
+function isAuthorized(req, config) {
+  return getClientApiKey(req) === config.relayApiKey
 }
 
 async function handleNativeMessages(req, res, config, bodyBuffer) {
@@ -289,6 +318,37 @@ function createServer(config) {
     }
 
     const path = new URL(req.url, 'http://relay.local').pathname.replace(/^\/api/, '')
+
+    if (path === '/oauth/authorize' || path === '/oauth/status' || path === '/oauth/exchange') {
+      if (!isAuthorized(req, config)) {
+        sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Invalid relay API key' } })
+        return
+      }
+
+      try {
+        if (req.method === 'GET' && path === '/oauth/authorize') {
+          sendJson(res, 200, config.oauthManager.createAuthorization())
+          return
+        }
+        if (req.method === 'GET' && path === '/oauth/status') {
+          sendJson(res, 200, config.oauthManager.status())
+          return
+        }
+        if (req.method === 'POST' && path === '/oauth/exchange') {
+          const body = JSON.parse((await readBody(req)).toString('utf8') || '{}')
+          const result = await config.oauthManager.exchange(body)
+          sendJson(res, 200, { success: true, data: result })
+          return
+        }
+      } catch (error) {
+        sendJson(res, error.statusCode || 400, { success: false, error: error.message })
+        return
+      }
+
+      sendJson(res, 404, { error: 'Not found' })
+      return
+    }
+
     const isMessages = path.startsWith('/v1/messages')
     const isResponses = path === '/v1/responses' || path === '/v1/responses/compact'
     if (req.method !== 'POST' || (!isMessages && !isResponses)) {
@@ -297,7 +357,7 @@ function createServer(config) {
       return
     }
 
-    if (getClientApiKey(req) !== config.relayApiKey) {
+    if (!isAuthorized(req, config)) {
       res.writeHead(401, { 'content-type': 'application/json', 'www-authenticate': 'Bearer' })
       res.end(JSON.stringify({
         type: 'error',
