@@ -2,6 +2,7 @@
 
 const http = require('node:http')
 const https = require('node:https')
+const { execFile } = require('node:child_process')
 const fs = require('node:fs')
 const pathModule = require('node:path')
 const { URL } = require('node:url')
@@ -77,6 +78,7 @@ function getConfig(env = process.env) {
     authMode,
     oauthManager,
     logPath: env.RELAY_LOG_PATH || pathModule.join(process.cwd(), 'launchd.log'),
+    launchdLabel: env.RELAY_LAUNCHD_LABEL || 'com.wanyou.minimal-claude-relay',
     authHeader: (env.ANTHROPIC_AUTH_HEADER || (authMode === 'oauth' ? 'authorization' : 'x-api-key')).toLowerCase(),
     deepSeekHarnessCompat: env.DEEPSEEK_HARNESS_COMPAT !== 'false'
   }
@@ -147,6 +149,58 @@ function upstreamPath(config, path) {
   const targetPath = path.replace(/^\/+/, '')
   const joined = `${basePath}/${targetPath}`.replace(/\/{2,}/g, '/')
   return joined.startsWith('/') ? joined : `/${joined}`
+}
+
+async function probeUpstream(config) {
+  const startedAt = Date.now()
+  let credential
+  try {
+    credential = config.authMode === 'oauth'
+      ? await config.oauthManager.getAccessToken()
+      : config.upstreamApiKey
+  } catch (error) {
+    return { ok: false, network_reachable: false, auth_ready: false, latency_ms: Date.now() - startedAt, error: error.message }
+  }
+
+  return new Promise((resolve) => {
+    const target = config.upstreamBaseUrl
+    const transport = target.protocol === 'http:' ? http : https
+    const request = transport.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (target.protocol === 'https:' ? 443 : 80),
+      method: 'GET',
+      path: upstreamPath(config, '/v1/models?limit=1'),
+      headers: {
+        accept: 'application/json',
+        'anthropic-version': '2023-06-01',
+        ...(config.authHeader === 'authorization'
+          ? { authorization: `Bearer ${credential}` }
+          : { 'x-api-key': credential })
+      },
+      timeout: 10000
+    }, (response) => {
+      const statusCode = response.statusCode || 0
+      response.resume()
+      response.on('end', () => resolve({
+        ok: statusCode >= 200 && statusCode < 300,
+        network_reachable: true,
+        auth_ready: statusCode !== 401 && statusCode !== 403,
+        status_code: statusCode,
+        latency_ms: Date.now() - startedAt
+      }))
+    })
+    request.on('timeout', () => request.destroy(new Error('upstream probe timed out')))
+    request.on('error', (error) => resolve({
+      ok: false,
+      network_reachable: false,
+      auth_ready: Boolean(credential),
+      latency_ms: Date.now() - startedAt,
+      error: error.message,
+      code: error.code || null
+    }))
+    request.end()
+  })
 }
 
 async function relayRequest(req, res, config, body, path, handlers) {
@@ -260,6 +314,12 @@ ANTHROPIC_AUTH_TOKEN=你的 RELAY_API_KEY</pre>
     <div class="row"><button class="secondary" onclick="loadLogs()">刷新日志</button></div>
     <pre id="logs">尚未加载日志</pre>
   </div>
+  <div class="card">
+    <h2>5. 上游检测与服务管理</h2>
+    <p>检测会真实请求 Claude 上游的轻量模型列表接口，不调用模型生成，不消耗文本 Token。</p>
+    <div class="row"><button class="secondary" onclick="loadDiagnostics()">检测上游连通性</button><button onclick="restartRelay()">重启服务</button></div>
+    <pre id="diagnostics">尚未检测</pre>
+  </div>
 </main>
 <script>
 const keyInput = document.getElementById('key')
@@ -274,6 +334,8 @@ async function loadStatus() { try { saveKey(); const data = await api('/oauth/st
 async function startOAuth() { try { saveKey(); const data = await api('/oauth/authorize'); const link = document.getElementById('authLink'); link.href = data.authUrl; link.style.display = 'inline-block'; resultBox.className = 'ok'; resultBox.textContent = '授权链接已生成。点击“打开 Claude 授权页”，完成后粘贴回调地址。' } catch (e) { resultBox.className = 'error'; resultBox.textContent = e.message } }
 async function exchangeOAuth() { try { saveKey(); const callbackUrl = document.getElementById('callback').value.trim(); if (!callbackUrl) throw new Error('请粘贴回调地址'); const data = await api('/oauth/exchange', { method: 'POST', body: JSON.stringify({ callbackUrl }) }); resultBox.className = 'ok'; resultBox.textContent = 'OAuth 完成：\\n' + JSON.stringify(data, null, 2); loadStatus() } catch (e) { resultBox.className = 'error'; resultBox.textContent = e.message } }
 async function loadLogs() { try { saveKey(); const data = await api('/logs?lines=200'); document.getElementById('logs').textContent = data.logs || '(暂无日志)' } catch (e) { document.getElementById('logs').textContent = e.message } }
+async function loadDiagnostics() { try { saveKey(); const data = await api('/diagnostics'); document.getElementById('diagnostics').textContent = JSON.stringify(data, null, 2) } catch (e) { document.getElementById('diagnostics').textContent = e.message } }
+async function restartRelay() { if (!confirm('确定重启本地中转服务吗？')) return; try { saveKey(); const data = await api('/admin/restart', { method: 'POST', body: '{}' }); document.getElementById('diagnostics').textContent = JSON.stringify(data, null, 2) + '\\n服务正在重启，请稍后刷新页面。' } catch (e) { document.getElementById('diagnostics').textContent = e.message } }
 </script>
 </body>
 </html>`
@@ -290,6 +352,40 @@ function readRecentLogs(logPath, lineCount = 200) {
     return content.split(/\r?\n/).slice(-count).join('\n')
   } catch (error) {
     return `日志暂不可用：${error.message}`
+  }
+}
+
+function getLaunchdStatus(label) {
+  if (process.platform !== 'darwin') return { available: false, reason: 'launchd is macOS-only' }
+  return new Promise((resolve) => {
+    const domain = `gui/${typeof process.getuid === 'function' ? process.getuid() : ''}/${label}`
+    execFile('/bin/launchctl', ['print', domain], { timeout: 3000 }, (error, stdout) => {
+      if (error) {
+        resolve({ available: false, label, error: error.message })
+        return
+      }
+      const state = stdout.match(/\bstate = ([^\n]+)/)?.[1]?.trim() || null
+      const pid = stdout.match(/\bpid = (\d+)/)?.[1] || null
+      resolve({ available: true, label, state, pid })
+    })
+  })
+}
+
+async function buildDiagnostics(config) {
+  return {
+    service: 'minimal-claude-relay',
+    ok: true,
+    pid: process.pid,
+    uptime_seconds: Math.floor(process.uptime()),
+    node: process.version,
+    platform: process.platform,
+    port: config.port,
+    auth_mode: config.authMode,
+    upstream: config.upstreamBaseUrl.origin,
+    upstream_probe: await probeUpstream(config),
+    oauth: config.oauthManager.status(),
+    launchd: await getLaunchdStatus(config.launchdLabel),
+    log_path: config.logPath
   }
 }
 
@@ -471,6 +567,32 @@ function createServer(config) {
       return
     }
 
+    if (path === '/diagnostics') {
+      if (req.method !== 'GET' || !isAuthorized(req, config)) {
+        sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Invalid relay API key' } })
+        return
+      }
+      sendJson(res, 200, await buildDiagnostics(config))
+      return
+    }
+
+    if (path === '/admin/restart') {
+      if (req.method !== 'POST' || !isAuthorized(req, config)) {
+        sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Invalid relay API key' } })
+        return
+      }
+      if (process.platform !== 'darwin') {
+        sendJson(res, 501, { success: false, error: 'LaunchAgent restart is only supported on macOS' })
+        return
+      }
+      sendJson(res, 202, { success: true, message: 'Restart scheduled', launchd_label: config.launchdLabel })
+      setTimeout(() => {
+        const domain = `gui/${typeof process.getuid === 'function' ? process.getuid() : ''}/${config.launchdLabel}`
+        execFile('/bin/launchctl', ['kickstart', '-k', domain], { timeout: 5000 }, () => {})
+      }, 100)
+      return
+    }
+
     const isMessages = path.startsWith('/v1/messages')
     const isResponses = path === '/v1/responses' || path === '/v1/responses/compact'
     if (req.method !== 'POST' || (!isMessages && !isResponses)) {
@@ -514,4 +636,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = { createServer, getConfig, normalizeIncomingPath, upstreamPath }
+module.exports = { createServer, getConfig, normalizeIncomingPath, upstreamPath, probeUpstream }

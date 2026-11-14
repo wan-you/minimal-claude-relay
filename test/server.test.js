@@ -3,7 +3,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('node:http')
-const { upstreamPath } = require('../server')
+const { upstreamPath, probeUpstream } = require('../server')
 
 test('removes the local /api compatibility prefix', () => {
   const config = { upstreamBaseUrl: new URL('https://api.anthropic.com') }
@@ -18,6 +18,29 @@ test('keeps the native /v1/messages path', () => {
 test('joins a configured upstream path once', () => {
   const config = { upstreamBaseUrl: new URL('https://example.test/anthropic') }
   assert.equal(upstreamPath(config, '/v1/messages'), '/anthropic/v1/messages')
+})
+
+test('probes upstream API connectivity without sending a model request', async (t) => {
+  let seenPath = null
+  const upstream = http.createServer((req, res) => {
+    seenPath = req.url
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end('{"data":[]}')
+  })
+  await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+  t.after(() => upstream.close())
+
+  const result = await probeUpstream({
+    authMode: 'api',
+    upstreamApiKey: 'probe-secret',
+    authHeader: 'x-api-key',
+    upstreamBaseUrl: new URL(`http://127.0.0.1:${upstream.address().port}`)
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.network_reachable, true)
+  assert.equal(result.auth_ready, true)
+  assert.equal(result.status_code, 200)
+  assert.equal(seenPath, '/v1/models?limit=1')
 })
 
 test('forwards the Claude body and replaces the client key', async (t) => {

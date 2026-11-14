@@ -105,6 +105,9 @@ http://127.0.0.1:3000/
 - `GET /oauth/authorize`
 - `POST /oauth/exchange`
 - `GET /oauth/status`
+- `GET /logs`（需要入站 Key，返回最近日志）
+- `GET /diagnostics`（需要入站 Key，检测进程、OAuth、LaunchAgent 和上游配置）
+- `POST /admin/restart`（需要入站 Key，在 macOS LaunchAgent 下重启服务）
 - `POST /v1/messages`
 - `POST /api/v1/messages`
 - `POST /v1/messages/count_tokens`（会原样转发）
