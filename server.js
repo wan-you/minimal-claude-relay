@@ -332,13 +332,13 @@ function renderHomePage() {
 <main>
   <div class="card">
     <h1>Minimal Claude Relay</h1>
-    <p>这是单账号 Claude 中转。这里的 Key 是进入中转的 <code>RELAY_API_KEY</code>，OAuth Token 会保存在服务端本地。</p>
+    <p>这是单账号 Claude 中转。本机管理面板无需输入 Key；远程访问管理接口仍需 <code>RELAY_API_KEY</code>。</p>
     <p class="muted">服务地址：<span id="origin"></span></p>
   </div>
   <div class="card">
-    <h2>1. 连接入站 Key</h2>
+    <h2>1. 管理面板访问</h2>
     <label for="key">RELAY_API_KEY</label>
-    <input id="key" type="password" autocomplete="off" placeholder="粘贴本地 .env 里的 RELAY_API_KEY">
+    <input id="key" type="password" autocomplete="off" placeholder="远程访问时填写 RELAY_API_KEY；本机访问可留空">
     <div class="row"><button class="secondary" onclick="saveKey()">保存到本页</button><button class="secondary" onclick="loadStatus()">查看 OAuth 状态</button></div>
     <div id="status" class="status-panel">尚未查询状态</div>
   </div>
@@ -383,7 +383,7 @@ function metric(label, value) { return '<div class="metric"><div class="metric-l
 function renderOAuth(data) { const state = data.configured ? (data.expired ? '已过期' : '已连接') : '未连接'; return '<div class="probe ' + (data.configured && !data.expired ? 'good' : 'bad') + '"><div class="probe-title">OAuth：' + state + '</div><div class="info-grid">' + metric('Token 来源', data.source || '-') + metric('Access Token', data.hasAccessToken ? '已配置' : '未配置') + metric('Refresh Token', data.hasRefreshToken ? '已配置' : '未配置') + metric('过期时间', data.expiresAt || '-') + '</div></div>' }
 function renderDiagnostics(data) { const p = data.upstream_probe || {}; const probeOk = p.ok === true; const probeTitle = probeOk ? '上游 Claude 可用' : (p.network_reachable ? '上游可达，但 API 检测失败' : '上游不可达'); return '<div class="probe ' + (probeOk ? 'good' : 'bad') + '"><div class="probe-title">' + probeTitle + '</div><div class="info-grid">' + metric('HTTP 状态', p.status_code || '-') + metric('延迟', p.latency_ms != null ? p.latency_ms + ' ms' : '-') + metric('网络连通', p.network_reachable ? '是' : '否') + metric('鉴权状态', p.auth_ready ? '可用' : '未就绪') + '</div>' + (p.error ? '<p>' + esc(p.error) + '</p>' : '') + '</div><div class="info-grid">' + metric('上游地址', data.upstream) + metric('认证模式', data.auth_mode) + metric('进程 PID', data.pid) + metric('运行时间', data.uptime_seconds + ' 秒') + metric('LaunchAgent', data.launchd?.state || '未知') + metric('日志路径', data.log_path) + '</div>' + renderOAuth(data.oauth || {}) }
 function renderProbeEvent(event) { const status = event.status || 'running'; let detail = event.message || ''; if (event.request) detail += '\\n' + event.request.method + ' ' + event.request.url + '\\n请求头：' + JSON.stringify(event.request.headers); if (event.response) detail += '\\n响应：' + JSON.stringify(event.response); if (event.result) detail += '\\n结果：' + JSON.stringify(event.result); return '<div class="timeline-step ' + esc(status) + '"><div class="timeline-title">' + esc(event.phase || 'step') + '</div><div class="timeline-detail">' + esc(detail) + '</div></div>' }
-function authHeaders(json) { const key = keyInput.value.trim(); if (!key) throw new Error('请先填写 RELAY_API_KEY'); const h = { Authorization: 'Bearer ' + key }; if (json) h['Content-Type'] = 'application/json'; return h }
+function authHeaders(json) { const key = keyInput.value.trim(); const h = {}; if (key) h.Authorization = 'Bearer ' + key; if (json) h['Content-Type'] = 'application/json'; return h }
 async function api(path, options = {}) { const response = await fetch(path, { ...options, headers: { ...authHeaders(Boolean(options.body)), ...(options.headers || {}) } }); const text = await response.text(); let data; try { data = JSON.parse(text) } catch { data = { raw: text } } if (!response.ok) throw new Error(data.error?.message || data.error || text || ('HTTP ' + response.status)); return data }
 async function loadStatus() { try { saveKey(); const data = await api('/oauth/status'); statusBox.className = ''; statusBox.innerHTML = renderOAuth(data) } catch (e) { statusBox.className = 'error'; statusBox.textContent = e.message } }
 async function startOAuth() { try { saveKey(); const data = await api('/oauth/authorize'); const link = document.getElementById('authLink'); link.href = data.authUrl; link.style.display = 'inline-block'; resultBox.className = 'ok'; resultBox.textContent = '授权链接已生成。点击“打开 Claude 授权页”，完成后粘贴回调地址。' } catch (e) { resultBox.className = 'error'; resultBox.textContent = e.message } }
@@ -398,6 +398,15 @@ async function restartRelay() { if (!confirm('确定重启本地中转服务吗�
 
 function isAuthorized(req, config) {
   return getClientApiKey(req) === config.relayApiKey
+}
+
+function isLoopbackRequest(req) {
+  const address = req.socket?.remoteAddress || ''
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+}
+
+function isManagementAuthorized(req, config) {
+  return isLoopbackRequest(req) || isAuthorized(req, config)
 }
 
 function readRecentLogs(logPath, lineCount = 200) {
@@ -583,7 +592,7 @@ function createServer(config) {
     const path = new URL(req.url, 'http://relay.local').pathname.replace(/^\/api/, '')
 
     if (path === '/oauth/authorize' || path === '/oauth/status' || path === '/oauth/exchange') {
-      if (!isAuthorized(req, config)) {
+      if (!isManagementAuthorized(req, config)) {
         sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Invalid relay API key' } })
         return
       }
@@ -613,7 +622,7 @@ function createServer(config) {
     }
 
     if (path === '/logs') {
-      if (req.method !== 'GET' || !isAuthorized(req, config)) {
+      if (req.method !== 'GET' || !isManagementAuthorized(req, config)) {
         sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Invalid relay API key' } })
         return
       }
@@ -623,7 +632,7 @@ function createServer(config) {
     }
 
     if (path === '/diagnostics') {
-      if (req.method !== 'GET' || !isAuthorized(req, config)) {
+      if (req.method !== 'GET' || !isManagementAuthorized(req, config)) {
         sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Invalid relay API key' } })
         return
       }
@@ -632,7 +641,7 @@ function createServer(config) {
     }
 
     if (path === '/diagnostics/stream') {
-      if (req.method !== 'POST' || !isAuthorized(req, config)) {
+      if (req.method !== 'POST' || !isManagementAuthorized(req, config)) {
         sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Invalid relay API key' } })
         return
       }
@@ -651,7 +660,7 @@ function createServer(config) {
     }
 
     if (path === '/admin/restart') {
-      if (req.method !== 'POST' || !isAuthorized(req, config)) {
+      if (req.method !== 'POST' || !isManagementAuthorized(req, config)) {
         sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Invalid relay API key' } })
         return
       }
