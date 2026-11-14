@@ -311,6 +311,15 @@ async function handleResponses(req, res, config, bodyBuffer) {
 
 function createServer(config) {
   return http.createServer(async (req, res) => {
+    if (req.method === 'GET' && req.url === '/') {
+      sendJson(res, 200, {
+        service: 'minimal-claude-relay',
+        ok: true,
+        endpoints: ['/health', '/oauth/authorize', '/oauth/exchange', '/oauth/status', '/api/v1/messages', '/v1/responses']
+      })
+      return
+    }
+
     if (req.method === 'GET' && req.url === '/health') {
       res.writeHead(200, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ ok: true }))
