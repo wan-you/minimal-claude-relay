@@ -151,16 +151,30 @@ function upstreamPath(config, path) {
   return joined.startsWith('/') ? joined : `/${joined}`
 }
 
-async function probeUpstream(config) {
+async function probeUpstream(config, onProgress = () => {}) {
   const startedAt = Date.now()
+  onProgress({ phase: 'prepare', status: 'running', message: '准备上游认证凭证' })
   let credential
   try {
     credential = config.authMode === 'oauth'
       ? await config.oauthManager.getAccessToken()
       : config.upstreamApiKey
   } catch (error) {
+    onProgress({ phase: 'prepare', status: 'error', message: error.message })
     return { ok: false, network_reachable: false, auth_ready: false, latency_ms: Date.now() - startedAt, error: error.message }
   }
+
+  const requestPath = upstreamPath(config, '/v1/models?limit=1')
+  onProgress({
+    phase: 'request',
+    status: 'running',
+    message: '发送上游模型列表探测请求',
+    request: {
+      method: 'GET',
+      url: `${config.upstreamBaseUrl.origin}${requestPath}`,
+      headers: { authorization: config.authHeader === 'authorization' ? 'Bearer ***' : undefined, 'x-api-key': config.authHeader === 'authorization' ? undefined : '***', 'anthropic-version': '2023-06-01' }
+    }
+  })
 
   return new Promise((resolve) => {
     const target = config.upstreamBaseUrl
@@ -170,7 +184,7 @@ async function probeUpstream(config) {
       hostname: target.hostname,
       port: target.port || (target.protocol === 'https:' ? 443 : 80),
       method: 'GET',
-      path: upstreamPath(config, '/v1/models?limit=1'),
+      path: requestPath,
       headers: {
         accept: 'application/json',
         'anthropic-version': '2023-06-01',
@@ -181,24 +195,43 @@ async function probeUpstream(config) {
       timeout: 10000
     }, (response) => {
       const statusCode = response.statusCode || 0
-      response.resume()
-      response.on('end', () => resolve({
-        ok: statusCode >= 200 && statusCode < 300,
-        network_reachable: true,
-        auth_ready: statusCode !== 401 && statusCode !== 403,
-        status_code: statusCode,
-        latency_ms: Date.now() - startedAt
-      }))
+      const chunks = []
+      let bodyBytes = 0
+      response.on('data', (chunk) => {
+        if (bodyBytes < 64 * 1024) {
+          chunks.push(chunk)
+          bodyBytes += chunk.length
+        }
+      })
+      response.on('end', () => {
+        const rawBody = Buffer.concat(chunks).toString('utf8')
+        let bodySummary = { bytes_sampled: bodyBytes }
+        try {
+          const parsed = JSON.parse(rawBody)
+          bodySummary = { ...bodySummary, model_count: Array.isArray(parsed.data) ? parsed.data.length : undefined, error_type: parsed.error?.type || undefined }
+        } catch {
+          bodySummary.parseable_json = false
+        }
+        const result = {
+          ok: statusCode >= 200 && statusCode < 300,
+          network_reachable: true,
+          auth_ready: statusCode !== 401 && statusCode !== 403,
+          status_code: statusCode,
+          latency_ms: Date.now() - startedAt,
+          response: { content_type: response.headers['content-type'] || null, body_summary: bodySummary }
+        }
+        onProgress({ phase: 'response', status: result.ok ? 'success' : 'error', message: `收到上游 HTTP ${statusCode}`, response: result.response, status_code: statusCode })
+        onProgress({ phase: 'complete', status: result.ok ? 'success' : 'error', message: result.ok ? '上游检测通过' : '上游返回非成功状态', result })
+        resolve(result)
+      })
     })
     request.on('timeout', () => request.destroy(new Error('upstream probe timed out')))
-    request.on('error', (error) => resolve({
-      ok: false,
-      network_reachable: false,
-      auth_ready: Boolean(credential),
-      latency_ms: Date.now() - startedAt,
-      error: error.message,
-      code: error.code || null
-    }))
+    request.on('error', (error) => {
+      const result = { ok: false, network_reachable: false, auth_ready: Boolean(credential), latency_ms: Date.now() - startedAt, error: error.message, code: error.code || null }
+      onProgress({ phase: 'response', status: 'error', message: error.message, result })
+      onProgress({ phase: 'complete', status: 'error', message: '上游检测失败', result })
+      resolve(result)
+    })
     request.end()
   })
 }
@@ -285,6 +318,13 @@ function renderHomePage() {
     .probe.good { background:#edf8f0; border-color:#b7dfc2; color:#14532d; }
     .probe.bad { background:#fff1f0; border-color:#f3b4ae; color:#8a1c13; }
     .probe-title { font-size:18px; font-weight:700; margin-bottom:5px; }
+    .timeline { display:grid; gap:8px; }
+    .timeline-step { border-left:3px solid #bbb; padding:10px 12px; background:#f2f2ef; border-radius:0 8px 8px 0; }
+    .timeline-step.success { border-left-color:#299447; }
+    .timeline-step.error { border-left-color:#c3342d; }
+    .timeline-step.running { border-left-color:#c99318; }
+    .timeline-title { font-weight:700; margin-bottom:4px; }
+    .timeline-detail { font-size:13px; color:#666; white-space:pre-wrap; word-break:break-word; }
     @media (max-width:560px) { .info-grid { grid-template-columns:1fr; } }
   </style>
 </head>
@@ -342,13 +382,14 @@ function esc(value) { return String(value ?? '-').replace(/[&<>"']/g, c => ({'&'
 function metric(label, value) { return '<div class="metric"><div class="metric-label">' + esc(label) + '</div><div class="metric-value">' + esc(value) + '</div></div>' }
 function renderOAuth(data) { const state = data.configured ? (data.expired ? '已过期' : '已连接') : '未连接'; return '<div class="probe ' + (data.configured && !data.expired ? 'good' : 'bad') + '"><div class="probe-title">OAuth：' + state + '</div><div class="info-grid">' + metric('Token 来源', data.source || '-') + metric('Access Token', data.hasAccessToken ? '已配置' : '未配置') + metric('Refresh Token', data.hasRefreshToken ? '已配置' : '未配置') + metric('过期时间', data.expiresAt || '-') + '</div></div>' }
 function renderDiagnostics(data) { const p = data.upstream_probe || {}; const probeOk = p.ok === true; const probeTitle = probeOk ? '上游 Claude 可用' : (p.network_reachable ? '上游可达，但 API 检测失败' : '上游不可达'); return '<div class="probe ' + (probeOk ? 'good' : 'bad') + '"><div class="probe-title">' + probeTitle + '</div><div class="info-grid">' + metric('HTTP 状态', p.status_code || '-') + metric('延迟', p.latency_ms != null ? p.latency_ms + ' ms' : '-') + metric('网络连通', p.network_reachable ? '是' : '否') + metric('鉴权状态', p.auth_ready ? '可用' : '未就绪') + '</div>' + (p.error ? '<p>' + esc(p.error) + '</p>' : '') + '</div><div class="info-grid">' + metric('上游地址', data.upstream) + metric('认证模式', data.auth_mode) + metric('进程 PID', data.pid) + metric('运行时间', data.uptime_seconds + ' 秒') + metric('LaunchAgent', data.launchd?.state || '未知') + metric('日志路径', data.log_path) + '</div>' + renderOAuth(data.oauth || {}) }
+function renderProbeEvent(event) { const status = event.status || 'running'; let detail = event.message || ''; if (event.request) detail += '\\n' + event.request.method + ' ' + event.request.url + '\\n请求头：' + JSON.stringify(event.request.headers); if (event.response) detail += '\\n响应：' + JSON.stringify(event.response); if (event.result) detail += '\\n结果：' + JSON.stringify(event.result); return '<div class="timeline-step ' + esc(status) + '"><div class="timeline-title">' + esc(event.phase || 'step') + '</div><div class="timeline-detail">' + esc(detail) + '</div></div>' }
 function authHeaders(json) { const key = keyInput.value.trim(); if (!key) throw new Error('请先填写 RELAY_API_KEY'); const h = { Authorization: 'Bearer ' + key }; if (json) h['Content-Type'] = 'application/json'; return h }
 async function api(path, options = {}) { const response = await fetch(path, { ...options, headers: { ...authHeaders(Boolean(options.body)), ...(options.headers || {}) } }); const text = await response.text(); let data; try { data = JSON.parse(text) } catch { data = { raw: text } } if (!response.ok) throw new Error(data.error?.message || data.error || text || ('HTTP ' + response.status)); return data }
 async function loadStatus() { try { saveKey(); const data = await api('/oauth/status'); statusBox.className = ''; statusBox.innerHTML = renderOAuth(data) } catch (e) { statusBox.className = 'error'; statusBox.textContent = e.message } }
 async function startOAuth() { try { saveKey(); const data = await api('/oauth/authorize'); const link = document.getElementById('authLink'); link.href = data.authUrl; link.style.display = 'inline-block'; resultBox.className = 'ok'; resultBox.textContent = '授权链接已生成。点击“打开 Claude 授权页”，完成后粘贴回调地址。' } catch (e) { resultBox.className = 'error'; resultBox.textContent = e.message } }
 async function exchangeOAuth() { try { saveKey(); const callbackUrl = document.getElementById('callback').value.trim(); if (!callbackUrl) throw new Error('请粘贴回调地址'); const data = await api('/oauth/exchange', { method: 'POST', body: JSON.stringify({ callbackUrl }) }); resultBox.className = 'ok'; resultBox.textContent = 'OAuth 完成：\\n' + JSON.stringify(data, null, 2); loadStatus() } catch (e) { resultBox.className = 'error'; resultBox.textContent = e.message } }
 async function loadLogs() { try { saveKey(); const data = await api('/logs?lines=200'); document.getElementById('logs').textContent = data.logs || '(暂无日志)' } catch (e) { document.getElementById('logs').textContent = e.message } }
-async function loadDiagnostics() { try { saveKey(); const data = await api('/diagnostics'); const box = document.getElementById('diagnostics'); box.className = ''; box.innerHTML = renderDiagnostics(data) } catch (e) { document.getElementById('diagnostics').className = 'error'; document.getElementById('diagnostics').textContent = e.message } }
+async function loadDiagnostics() { const box = document.getElementById('diagnostics'); try { saveKey(); const response = await fetch('/diagnostics/stream', { method: 'POST', headers: authHeaders(true), body: '{}' }); if (!response.ok) throw new Error(await response.text()); const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = ''; const events = []; const render = () => { box.className = ''; box.innerHTML = '<div class="timeline">' + events.map(renderProbeEvent).join('') + '</div>' }; while (true) { const part = await reader.read(); if (part.done) break; buffer += decoder.decode(part.value, { stream: true }); const chunks = buffer.split('\n\n'); buffer = chunks.pop() || ''; for (const chunk of chunks) { const line = chunk.split('\n').find(x => x.startsWith('data: ')); if (!line) continue; try { const event = JSON.parse(line.slice(6)); events.push(event); render(); } catch {} } } render() } catch (e) { box.className = 'error'; box.textContent = e.message } }
 async function restartRelay() { if (!confirm('确定重启本地中转服务吗？')) return; try { saveKey(); const data = await api('/admin/restart', { method: 'POST', body: '{}' }); document.getElementById('diagnostics').textContent = JSON.stringify(data, null, 2) + '\\n服务正在重启，请稍后刷新页面。' } catch (e) { document.getElementById('diagnostics').textContent = e.message } }
 </script>
 </body>
@@ -385,7 +426,7 @@ function getLaunchdStatus(label) {
   })
 }
 
-async function buildDiagnostics(config) {
+async function buildDiagnostics(config, onProgress = () => {}) {
   return {
     service: 'minimal-claude-relay',
     ok: true,
@@ -396,7 +437,7 @@ async function buildDiagnostics(config) {
     port: config.port,
     auth_mode: config.authMode,
     upstream: config.upstreamBaseUrl.origin,
-    upstream_probe: await probeUpstream(config),
+    upstream_probe: await probeUpstream(config, onProgress),
     oauth: config.oauthManager.status(),
     launchd: await getLaunchdStatus(config.launchdLabel),
     log_path: config.logPath
@@ -587,6 +628,25 @@ function createServer(config) {
         return
       }
       sendJson(res, 200, await buildDiagnostics(config))
+      return
+    }
+
+    if (path === '/diagnostics/stream') {
+      if (req.method !== 'POST' || !isAuthorized(req, config)) {
+        sendJson(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Invalid relay API key' } })
+        return
+      }
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
+      const sendEvent = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`)
+      try {
+        sendEvent({ phase: 'start', status: 'running', message: '开始检测服务与上游' })
+        const result = await buildDiagnostics(config, sendEvent)
+        sendEvent({ phase: 'diagnostics', status: 'success', message: '本地服务检测完成', diagnostics: result })
+        sendEvent({ phase: 'done', status: 'success', message: '检测结束' })
+      } catch (error) {
+        sendEvent({ phase: 'done', status: 'error', message: error.message })
+      }
+      res.end()
       return
     }
 
